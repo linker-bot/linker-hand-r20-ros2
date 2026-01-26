@@ -86,20 +86,20 @@ class LinkerHandR20(Node):
             
             tmp_range=[]
             tmp_angle = []
-            # for k, v in self.ctl.model.joints.items():
-            #     if k < 17:
-            #         # print(f"K:{k} V:{v}", flush=True)
-            #         tmp_angle.append(v.current_pos)
-            #         tmp_range.append(self.to_uint8(v.current_pos, v.min_pos, v.max_pos))
-            # # 按照映射表重排为位置顺序motor→position_cmd
-            # state_range = self.reorder_by_map(tmp_range[:11] + [0, 0, 0, 0] + tmp_range[11:], self.position_to_motor_map, reverse=True)
+            for k, v in self.ctl.model.joints.items():
+                if k < 17:
+                    # print(f"K:{k} V:{v}", flush=True)
+                    tmp_angle.append(v.current_pos)
+                    tmp_range.append(self.to_uint8(v.current_pos, v.min_pos, v.max_pos))
+            # 按照映射表重排为位置顺序motor→position_cmd
+            state_range = self.reorder_by_map(tmp_range[:11] + [0, 0, 0, 0] + tmp_range[11:], self.position_to_motor_map, reverse=True)
             
-            # state_angle = self.reorder_by_map(tmp_angle[:11] + [0, 0, 0, 0] + tmp_angle[11:], self.position_to_motor_map, reverse=True)
-            # state_range_msg = self.joint_state_msg(pose=state_range)
-            # state_angle_msg = self.joint_state_msg(pose=state_angle)
-            # self.hand_state_pub.publish(state_range_msg)
-            # self.hand_state_arc_pub.publish(state_angle_msg)
-            # time.sleep(0.05)
+            state_angle = self.reorder_by_map(tmp_angle[:11] + [0, 0, 0, 0] + tmp_angle[11:], self.position_to_motor_map, reverse=True)
+            state_range_msg = self.joint_state_msg(pose=state_range)
+            state_angle_msg = self.joint_state_msg(pose=state_angle)
+            self.hand_state_pub.publish(state_range_msg)
+            self.hand_state_arc_pub.publish(state_angle_msg)
+            time.sleep(0.05)
 
     def joint_state_msg(self, pose,vel=[]):
         joint_state = JointState()
