@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+from launch import LaunchDescription
+from launch_ros.actions import Node
+
+def generate_launch_description():
+    return LaunchDescription([
+        Node(
+            package='gui_control',
+            executable='gui_control',
+            name='left_hand_control_node',
+            output='screen',
+            parameters=[{
+                'hand_type': 'right',  # 配置Linker Hand灵巧手类型 left | right 字母为小写
+                'hand_joint': "R20",  # O6\L6\L7\L10\L20\G20(工业版)\L21 字母为大写
+                'topic_hz': 10, # topic发布频率
+            }],
+        ),
+        # Node(
+        #     package='gui_control',
+        #     executable='gui_control',
+        #     name='right_hand_control_node',
+        #     output='screen',
+        #     parameters=[{
+        #         'hand_type': 'right',
+        #         'hand_joint': "L10",
+        #         'topic_hz': 30,
+        #         'is_touch': True,
+        #     }],
+        # ),
+    ])
