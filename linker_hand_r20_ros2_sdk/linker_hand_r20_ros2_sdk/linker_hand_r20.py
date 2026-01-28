@@ -42,14 +42,24 @@ class LinkerHandR20(Node):
             self.get_logger().error("Linker Hand R20 ROS2 SDK 连接失败")
 
 
+    def validate_strict_non_negative_ints(self, lst):
+        """校验：所有元素必须是 int 类型，且 >= 0（排除 bool/str/float/负数）"""
+        if len(lst) != 20:
+            return False
+        else:
+            return all(type(x) is int and x >= 0 for x in lst)
+
     def hand_control_cb(self, msg):
-        #print(msg, flush=True)
         position = list(msg.position)
-        tmp_list = [position[i] for i in self.position_to_motor_map]
-        # 删除预留元素
-        motor_tmp = tmp_list[:11] + tmp_list[15:]
-        # 将接收到的范围值转角度值
-        self.motor_list = [self.uint8_to_angle(int(v), JOINT_DEFINITIONS[i]) for i, v in enumerate(motor_tmp)]
+        if not self.validate_strict_non_negative_ints(position):
+            self.get_logger().error("hand_control_cmd topic 输入的位置值不合法,请检查输入值是否为整数且大于等于0, 长度为20")
+            self.motor_list = None
+        else:
+            tmp_list = [position[i] for i in self.position_to_motor_map]
+            # 删除预留元素
+            motor_tmp = tmp_list[:11] + tmp_list[15:]
+            # 将接收到的范围值转角度值
+            self.motor_list = [self.uint8_to_angle(int(v), JOINT_DEFINITIONS[i]) for i, v in enumerate(motor_tmp)]
         
 
     def to_uint8(self, p, p_min, p_max):
