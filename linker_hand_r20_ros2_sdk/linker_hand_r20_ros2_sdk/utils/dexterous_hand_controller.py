@@ -28,7 +28,7 @@ import numpy as np
 from datetime import datetime
 
 # 添加python3.11目录到路径
-#sys.path.append(os.path.join(os.path.dirname(__file__), 'python3.11'))
+# sys.path.append(os.path.join(os.path.dirname(__file__), 'python3.11'))
 
 # 导入CANFD库
 from ctypes import *
@@ -101,6 +101,10 @@ class RegisterAddress(Enum):
     TACTILE_PINKY_DATA1 = 0x11
     TACTILE_PINKY_DATA2 = 0x12
     SYS_TEMP_DATA = 0x13  # 温度寄存器
+    SYS_MOTOR_CURRENT = 0x15  # 电机电流寄存器
+    SYS_JOINT_OFFSET = 0x16  # 关节位置偏差寄存器（可读写，写入后自动保存到Flash）
+    SYS_OC_PROT = 0x20  # 过流保护值寄存器
+    SYS_OC_PROT_TIME = 0x21  # 过流保护时间寄存器
     SYS_SERIAL_NUMBER = 0x6E  # 设备信息修改寄存器（可读写，写入后自动保存到Flash）
 
 # 关节信息定义
@@ -117,8 +121,12 @@ class JointInfo:
     target_vel: int = 0
     target_acc: int = 0
     current_temp: int = 0  # 当前温度
+    current_current: int = 0  # 当前电流 (mA)
+    joint_offset: int = 0  # 关节位置偏差（单位：0.087度）
     error_status: int = 0
     config_status: int = 0
+    oc_prot: int = 220  # 过流保护阈值 (mA)
+    oc_prot_time: int = 110  # 过流保护时间 (ms)
 
 # 手指关节定义 - 按照协议规范v2.0的电机ID分配
 JOINT_DEFINITIONS = [
@@ -156,7 +164,7 @@ class CANFDCommunication:
     """CANFD通信类"""
 
     def __init__(self):
-        # 根据Python架构选择对应的DLL
+        # # 根据Python架构选择对应的DLL
         # import platform
         # arch = platform.architecture()[0]
         # if arch == '64bit':
@@ -186,6 +194,7 @@ class CANFDCommunication:
             # # 加载DLL
             # print(f"加载CANFD库: {self.dll_path}")
             # self.canDLL = windll.LoadLibrary(self.dll_path)
+
             CDLL("/usr/local/lib/libusb-1.0.so", RTLD_GLOBAL)
             time.sleep(0.1)  # 确保库加载完成
             self.canDLL = cdll.LoadLibrary("/usr/local/lib/libcanbus.so")  #动态库路径
@@ -247,6 +256,7 @@ class CANFDCommunication:
             print("  数据段波特率: 5Mbps")
 
             start_time = time.time()
+
             try:
                 # 1Mbps仲裁段，5Mbps数据段
                 can_config = CanFD_Config(
@@ -265,14 +275,13 @@ class CANFDCommunication:
                     0x1       # Cantype: CANFD类型
                 )
 
-                #ret = self.canDLL.CANFD_Init(self.channel, byref(can_config))
-                ret = self.canDLL.CANFD_Init(0,self.channel, byref(can_config))
+                ret = self.canDLL.CANFD_Init(0, self.channel, byref(can_config))
                 config_time = time.time() - start_time
 
                 if ret != STATUS_OK:
                     print(f"❌ CANFD初始化失败，错误码: {ret} (耗时: {config_time:.3f}s)")
                     print("   正在关闭设备...")
-                    self.canDLL.CAN_CloseDevice(self.channel)
+                    self.canDLL.CAN_CloseDevice(0, self.channel)
                     return False
                 else:
                     print(f"✅ CANFD配置成功 (耗时: {config_time:.3f}s)")
@@ -281,7 +290,7 @@ class CANFDCommunication:
                 config_time = time.time() - start_time
                 print(f"❌ CANFD配置异常 (耗时: {config_time:.3f}s): {e}")
                 try:
-                    self.canDLL.CAN_CloseDevice(self.channel)
+                    self.canDLL.CAN_CloseDevice(0, self.channel)
                 except:
                     pass
                 return False
@@ -338,7 +347,7 @@ class CANFDCommunication:
         # 尝试查询右手设备
         print("   查询右手设备 (ID: 0x01)...")
         right_hand_response = self._query_single_device(DeviceID.RIGHT_HAND.value)
-        
+
         # 尝试查询左手设备
         print("   查询左手设备 (ID: 0x02)...")
         left_hand_response = self._query_single_device(DeviceID.LEFT_HAND.value)
@@ -364,27 +373,30 @@ class CANFDCommunication:
         """查询单个设备是否存在"""
         try:
             # 多次尝试查询
-            for attempt in range(1):
-                #print(f"     尝试 {attempt + 1}/3...")
+            for attempt in range(3):
+                print(f"     尝试 {attempt + 1}/3...")
 
                 # 临时设置设备ID用于发送
                 original_device_id = self.device_id
                 self.device_id = device_id
+
                 # 发送设备信息查询命令
                 success = self.send_message(RegisterAddress.SYS_DEVICE_INFO.value, b'', False)
-                
+
                 # 恢复原始设备ID
                 self.device_id = original_device_id
 
                 if not success:
-                    print(f"     发送查询命令失败", flush=True)
+                    print(f"     发送查询命令失败")
                     continue
 
                 # 等待响应
+                import time
                 time.sleep(0.1)  # 100ms等待
+
                 # 接收响应 - 不过滤设备ID，接收所有消息
                 messages = self.receive_messages(200, filter_device_id=False)
-                
+
                 # 检查是否有来自目标设备的响应
                 for frame_id, data in messages:
                     response_device_id = (frame_id >> 21) & 0xFF
@@ -393,49 +405,49 @@ class CANFDCommunication:
                     if (response_device_id == device_id and
                         register_addr == RegisterAddress.SYS_DEVICE_INFO.value and
                         len(data) > 0):
-                        print(f"     ✅ 设备 0x{device_id:02X} 响应正常 (数据长度: {len(data)})", flush=True)
+                        print(f"     ✅ 设备 0x{device_id:02X} 响应正常 (数据长度: {len(data)})")
 
                         # 检查数据是否全为0
                         if all(b == 0 for b in data):
-                            print(f"     ⚠️ 设备信息数据全为0，可能设备信息未初始化", flush=True)
+                            print(f"     ⚠️ 设备信息数据全为0，可能设备信息未初始化")
                             # 即使数据为0，也认为设备存在并响应
                             # 根据查询的设备ID来判断类型
                             device_type = "右手" if device_id == 0x01 else "左手"
-                            print(f"     根据查询ID判断设备类型: {device_type}", flush=True)
+                            print(f"     根据查询ID判断设备类型: {device_type}")
                             return True
                         else:
                             # 解析设备信息
                             try:
                                 if len(data) >= 50:
                                     product_model = data[0:10].decode('utf-8', errors='ignore').strip('\x00')
-                                    # 手型标志位在第51字节（索引50）：1=右手，0=左手
+                                    # 手型标志位在第51字节（索引50）：1=右手，2=左手
                                     hand_type = "右手" if len(data) > 50 and data[50] == 1 else "左手"
-                                    print(f"     设备信息: {product_model}, 类型: {hand_type}", flush=True)
+                                    print(f"     设备信息: {product_model}, 类型: {hand_type}")
                                 else:
-                                    print(f"     数据长度不足，无法解析设备信息", flush=True)
+                                    print(f"     数据长度不足，无法解析设备信息")
                             except Exception as e:
-                                print(f"     解析设备信息失败: {e}", flush=True)
+                                print(f"     解析设备信息失败: {e}")
                             return True
 
-                print(f"     第 {attempt + 1} 次查询无响应", flush=True)
+                print(f"     第 {attempt + 1} 次查询无响应")
                 time.sleep(0.1)  # 重试间隔
 
-            print(f"     ❌ 设备 0x{device_id:02X} 无响应,请检查配置文件是否正确", flush=True)
+            print(f"     ❌ 设备 0x{device_id:02X} 无响应 (已尝试3次)")
             return False
 
         except Exception as e:
-            print(f"     ❌ 查询设备 0x{device_id:02X} 异常: {e}", flush=True)
+            print(f"     ❌ 查询设备 0x{device_id:02X} 异常: {e}")
             return False
 
         except OSError as e:
             if "193" in str(e):
-                print("错误: DLL架构不匹配", flush=True)
-                print("请确认CANFD库文件与Python架构匹配", flush=True)
+                print("错误: DLL架构不匹配")
+                print("请确认CANFD库文件与Python架构匹配")
             else:
-                print(f"错误: 加载CANFD库失败: {e}", flush=True)
+                print(f"错误: 加载CANFD库失败: {e}")
             return False
         except Exception as e:
-            print(f"CANFD初始化失败: {e}", flush=True)
+            print(f"CANFD初始化失败: {e}")
             return False
 
     def _read_device_info(self):
@@ -490,8 +502,7 @@ class CANFDCommunication:
                 decoded_reg = (frame_id >> 13) & 0xFF
                 decoded_rw = (frame_id >> 12) & 0x1
                 print(f"     调试: 发送帧 -> ID:0x{frame_id:08X}, Decoded Device:0x{decoded_dev:02X}, Reg:0x{decoded_reg:02X}, R/W:{decoded_rw}")
-            except Exception as e:
-                print(e)
+            except Exception:
                 pass
 
             # 对于SYS_SERIAL_NUMBER寄存器，写入操作时
@@ -693,7 +704,6 @@ class CANFDCommunication:
             # 接收消息
             ret = self.canDLL.CANFD_Receive(0, self.channel, byref(receive_buffer.ADDR), 2000, timeout_ms)
 
-
             messages = []
             if ret > 0:
                 print(f"     接收到 {ret} 条消息")
@@ -760,6 +770,7 @@ class CANFDCommunication:
         self.close()
         time.sleep(1)  # 等待1秒
         return self.initialize()
+        
 print = lambda *_, **__: None
 class DexterousHandModel:
     """灵巧手数据模型"""
@@ -807,6 +818,42 @@ class DexterousHandModel:
             if motor_id in self.joints:
                 self.joints[motor_id].error_status = error
 
+    def update_motor_currents(self, currents: List[int]):
+        """更新电机电流"""
+        for i, current in enumerate(currents[:17]):
+            motor_id = i + 1  # 数组索引转换为电机ID
+            if motor_id in self.joints:
+                self.joints[motor_id].current_current = current
+
+    def update_joint_offsets(self, offsets: List[int]):
+        """更新关节位置偏差"""
+        for i, offset in enumerate(offsets[:17]):
+            motor_id = i + 1  # 数组索引转换为电机ID
+            if motor_id in self.joints:
+                self.joints[motor_id].joint_offset = offset
+
+    def update_oc_prot(self, values: List[int]):
+        """更新过流保护阈值"""
+        for i, val in enumerate(values[:17]):
+            motor_id = i + 1
+            if motor_id in self.joints:
+                self.joints[motor_id].oc_prot = val
+
+    def update_oc_prot_time(self, values: List[int]):
+        """更新过流保护时间"""
+        for i, val in enumerate(values[:17]):
+            motor_id = i + 1
+            if motor_id in self.joints:
+                self.joints[motor_id].oc_prot_time = val
+
+    def get_all_joint_offsets(self) -> List[int]:
+        """获取所有关节偏差"""
+        offsets = [0] * 17
+        for joint in self.joints.values():
+            if 1 <= joint.id <= 17:
+                offsets[joint.id - 1] = joint.joint_offset
+        return offsets
+
     def update_tactile_data(self, finger: str, data: np.ndarray):
         """更新触觉传感器数据"""
         if finger in self.tactile_data:
@@ -850,8 +897,6 @@ class DexterousHandController:
         self.is_running = False
         self.update_thread = None
         self.receive_thread = None
-        self.positions = [-1] * 17
-        self.velocities = [-1] * 17
         self.update_interval = 0.01  # 10ms更新间隔
         # 触觉数据缓冲区，用于拼接DATA1和DATA2
         self.tactile_buffer = {
@@ -941,7 +986,6 @@ class DexterousHandController:
                     # 根据寄存器地址分发处理
                     if register_addr == RegisterAddress.SYS_CURRENT_POS.value:
                         positions = self._parse_position_data(data)
-                        self.positions = positions
                         if len(positions) == 17:
                             self.model.update_joint_positions(positions)
 
@@ -960,9 +1004,30 @@ class DexterousHandController:
                         if temperatures:
                             self.model.update_joint_temperatures(temperatures)
 
+                    elif register_addr == RegisterAddress.SYS_MOTOR_CURRENT.value:
+                        currents = self._parse_current_data(data)
+                        if currents:
+                            self.model.update_motor_currents(currents)
+
+                    elif register_addr == RegisterAddress.SYS_JOINT_OFFSET.value:
+                        offsets = self._parse_offset_data(data)
+                        if offsets:
+                            self.model.update_joint_offsets(offsets)
+
+                    elif register_addr == RegisterAddress.SYS_OC_PROT.value:
+                        values = self._parse_oc_prot_data(data)
+                        if values:
+                            self.model.update_oc_prot(values)
+
+                    elif register_addr == RegisterAddress.SYS_OC_PROT_TIME.value:
+                        values = self._parse_oc_prot_time_data(data)
+                        if values:
+                            self.model.update_oc_prot_time(values)
+
                     # 处理触觉数据 (0x09 - 0x12)
                     elif RegisterAddress.TACTILE_THUMB_DATA1.value <= register_addr <= RegisterAddress.TACTILE_PINKY_DATA2.value:
                         self._handle_tactile_message(register_addr, data)
+
 
             except Exception as e:
                 print(f"接收循环错误: {e}")
@@ -1028,9 +1093,14 @@ class DexterousHandController:
                 # 读取错误状态
                 self._read_error_status()
 
+                # 读取当前电流
+                self._read_motor_currents()
+
                 # 定期读取当前温度 (每10秒)
                 temp_read_counter += 1
-                if temp_read_counter >= temp_read_interval:
+                if temp_read_counter == 1:
+                    self._read_current_temperatures()
+                elif temp_read_counter >= temp_read_interval:
                     temp_read_counter = 0
                     self._read_current_temperatures()
 
@@ -1072,7 +1142,106 @@ class DexterousHandController:
         except Exception as e:
             print(f"发送读取温度请求失败: {e}")
 
+    def _read_motor_currents(self):
+        """读取电机电流（仅发送请求）"""
+        try:
+            self.comm.send_message(RegisterAddress.SYS_MOTOR_CURRENT.value, b'', False)
+        except Exception as e:
+            print(f"发送读取电流请求失败: {e}")
+
+    def _read_joint_offsets(self):
+        """读取关节位置偏差（仅发送请求）"""
+        try:
+            self.comm.send_message(RegisterAddress.SYS_JOINT_OFFSET.value, b'', False)
+        except Exception as e:
+            print(f"发送读取偏差请求失败: {e}")
+
+    def _read_oc_protection(self):
+        """读取过流保护阈值"""
+        try:
+            self.comm.send_message(RegisterAddress.SYS_OC_PROT.value, b'', False)
+        except Exception as e:
+            print(f"发送读取过流保护请求失败: {e}")
+
+    def _read_oc_protection_time(self):
+        """读取过流保护时间"""
+        try:
+            self.comm.send_message(RegisterAddress.SYS_OC_PROT_TIME.value, b'', False)
+        except Exception as e:
+            print(f"发送读取过流保护时间请求失败: {e}")
+
+    def set_joint_offsets(self, offsets: List[int]) -> bool:
+        """设置关节位置偏差并保存到Flash
+        
+        Args:
+            offsets: 17个关节的偏差值列表（单位：0.087度）
+        """
+        if len(offsets) != 17:
+            print(f"❌ 偏差数据长度错误: 期望17个，实际{len(offsets)}个")
+            return False
+
+        print(f"📤 设置关节偏差命令:")
+        print(f"   输入偏差数组: {offsets}")
+
+        # 构造偏差数据
+        data = bytearray()
+        for i, offset in enumerate(offsets):
+            # 限制偏差范围
+            clamped_offset = max(-32768, min(32767, offset))
+            # 转换为小端序字节
+            offset_bytes = clamped_offset.to_bytes(2, byteorder='little', signed=True)
+            data.extend(offset_bytes)
+            
+            # 打印每个关节的偏差信息
+            if i < len(JOINT_DEFINITIONS):
+                joint_def = JOINT_DEFINITIONS[i]
+                angle_deg = clamped_offset * POSITION_UNIT  # 转换为角度
+                print(f"   电机{joint_def.id:2d} ({joint_def.finger}-{joint_def.name}): "
+                      f"偏差值={clamped_offset:6d}, 角度={angle_deg:7.2f}°")
+
+        print(f"   数据包大小: {len(data)}字节")
+        print(f"   原始数据: {data.hex().upper()}")
+
+        # 发送偏差命令
+        success = self.comm.send_message(RegisterAddress.SYS_JOINT_OFFSET.value, bytes(data), True)
+
+        if success:
+            print(f"   ✅ 偏差命令发送成功（已保存到Flash）")
+        else:
+            print(f"   ❌ 偏差命令发送失败")
+
+        return success
+
+    def set_oc_protection(self, values: List[int]) -> bool:
+        """设置过流保护阈值"""
+        if len(values) != 17: return False
+        data = bytearray()
+        for val in values:
+            clamped = max(0, min(65535, val))
+            data.extend(clamped.to_bytes(2, byteorder='little', signed=False))
+        print(f"📤 设置过流保护: {values}")
+        return self.comm.send_message(RegisterAddress.SYS_OC_PROT.value, bytes(data), True)
+
+    def set_oc_protection_time(self, values: List[int]) -> bool:
+        """设置过流保护时间"""
+        if len(values) != 17: return False
+        data = bytearray()
+        for val in values:
+            clamped = max(0, min(65535, val))
+            data.extend(clamped.to_bytes(2, byteorder='little', signed=False))
+        print(f"📤 设置过流保护时间: {values}")
+        return self.comm.send_message(RegisterAddress.SYS_OC_PROT_TIME.value, bytes(data), True)
+
+    def clear_error_status(self) -> bool:
+        """清除错误状态"""
+        # 写入17个0
+        data = bytes([0] * 17)
+        print(f"🧹 清除错误状态...")
+        return self.comm.send_message(RegisterAddress.SYS_ERROR_STATUS.value, data, True)
+
     def _read_tactile_data(self):
+
+
         """读取触觉传感器数据"""
         # 读取各个手指的触觉数据
         tactile_registers = [
@@ -1163,12 +1332,75 @@ class DexterousHandController:
             
         return temperatures
 
-    def read_current_positions(self):
-        self._read_current_positions()
-        time.sleep(0.005)  # 等待响应
-        return self.positions
+    def _parse_current_data(self, data: bytes) -> List[int]:
+        """解析电流数据
+
+        数据格式：34字节，每2字节对应一个电机的电流
+        单位：mA
+        数据类型：int16_t，小端序，有符号
+        """
+        # 调试打印原始数据
+        print(f"      [DEBUG] 原始电流数据 (hex): {data.hex()}")
+        
+        currents = []
+        for i in range(0, min(34, len(data)), 2):
+            if i + 1 < len(data):
+                # 解析16位有符号整数，小端序
+                current = int.from_bytes(data[i:i+2], byteorder='little', signed=True)
+                currents.append(current)
+            
+        # 如果数据长度不足17，补齐0
+        while len(currents) < 17:
+            currents.append(0)
+            
+        return currents
+
+    def _parse_offset_data(self, data: bytes) -> List[int]:
+        """解析关节位置偏差数据
+
+        数据格式：34字节，每2字节对应一个关节的偏差
+        单位：0.087度
+        数据类型：int16_t，小端序，有符号
+        """
+        # 调试打印原始数据
+        print(f"      [DEBUG] 原始偏差数据 (hex): {data.hex()}")
+        
+        offsets = []
+        for i in range(0, min(34, len(data)), 2):
+            if i + 1 < len(data):
+                # 解析16位有符号整数，小端序
+                offset = int.from_bytes(data[i:i+2], byteorder='little', signed=True)
+                offsets.append(offset)
+            
+        # 如果数据长度不足17，补齐0
+        while len(offsets) < 17:
+            offsets.append(0)
+            
+        return offsets
+
+    def _parse_oc_prot_data(self, data: bytes) -> List[int]:
+        """解析过流保护阈值数据 (uint16_t)"""
+        values = []
+        for i in range(0, min(34, len(data)), 2):
+            if i + 1 < len(data):
+                val = int.from_bytes(data[i:i+2], byteorder='little', signed=False)
+                values.append(val)
+        while len(values) < 17: values.append(220)
+        return values
+
+    def _parse_oc_prot_time_data(self, data: bytes) -> List[int]:
+        """解析过流保护时间数据 (uint16_t)"""
+        values = []
+        for i in range(0, min(34, len(data)), 2):
+            if i + 1 < len(data):
+                val = int.from_bytes(data[i:i+2], byteorder='little', signed=False)
+                values.append(val)
+        while len(values) < 17: values.append(110)
+        return values
 
     def set_joint_positions(self, positions: List[int]) -> bool:
+
+
         """设置关节位置"""
         if len(positions) != 17:
             print(f"❌ 位置数据长度错误: 期望17个，实际{len(positions)}个")
@@ -1707,16 +1939,30 @@ class DexterousHandGUI:
         self.last_entry_values = {}
 
     def setup_window(self):
-        """设置窗口 - 暗黑主题"""
+        """设置窗口 - 暗黑主题，自适应屏幕"""
         self.root.title("R20灵巧手控制系统 v2.0")
-        self.root.geometry("1400x1080")  # 增大窗口尺寸以适应更多内容
+        
+        # 获取屏幕尺寸
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        
+        # 根据屏幕大小动态设置窗口尺寸 (占屏幕90%)
+        window_width = min(1400, int(screen_width * 0.9))
+        window_height = min(1000, int(screen_height * 0.9))
+        
+        # 计算窗口居中位置
+        x = (screen_width - window_width) // 2
+        y = (screen_height - window_height) // 2
+        
+        self.root.geometry(f"{window_width}x{window_height}+{x}+{y}")
         self.root.configure(bg='#1e1e1e')  # 暗黑背景
         
         # 设置窗口最小尺寸
-        self.root.minsize(1200, 800)
+        self.root.minsize(1000, 700)
         
         # 暗黑主题样式配置
         self.setup_dark_theme()
+
 
     def setup_dark_theme(self):
         """设置暗黑主题样式"""
@@ -1912,7 +2158,7 @@ class DexterousHandGUI:
     def create_widgets(self):
         """创建界面组件 - 暗黑主题优化布局"""
         # 主框架 - 使用暗黑主题
-        main_frame = ttk.Frame(self.root, padding="15", style='Dark.TFrame')
+        main_frame = ttk.Frame(self.root, padding="5", style='Dark.TFrame')
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
         # 配置网格权重
@@ -1926,7 +2172,7 @@ class DexterousHandGUI:
         
         # 主要内容区域 - 水平布局
         content_frame = ttk.Frame(main_frame, style='Dark.TFrame')
-        content_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(10, 0))
+        content_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(2, 0))
         content_frame.columnconfigure(0, weight=1)  # 左侧面板
         content_frame.columnconfigure(1, weight=2)  # 中间面板（更宽）
         content_frame.columnconfigure(2, weight=1)  # 右侧面板
@@ -1947,13 +2193,10 @@ class DexterousHandGUI:
     def create_title_bar(self, parent):
         """创建标题栏"""
         title_frame = ttk.Frame(parent, style='Dark.TFrame')
-        title_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        title_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 0))
         title_frame.columnconfigure(0, weight=1)
         title_frame.columnconfigure(2, weight=1)
         
-        # 主标题
-        title_label = ttk.Label(title_frame, text="R20灵巧手控制系统 v2.0", style='Title.TLabel')
-        title_label.grid(row=0, column=1)
         
         # 状态信息
         info_frame = ttk.Frame(title_frame, style='Dark.TFrame')
@@ -2010,12 +2253,19 @@ class DexterousHandGUI:
         quick_frame.columnconfigure(0, weight=1)
         quick_frame.columnconfigure(1, weight=1)
         quick_frame.columnconfigure(2, weight=1)
+        quick_frame.columnconfigure(3, weight=1)
         
-        ttk.Button(quick_frame, text="✋ 五指张开", command=self.open_hand,
+        ttk.Button(quick_frame, text="五指张开", command=self.open_hand,
                   style='Success.TButton').grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
         
-        ttk.Button(quick_frame, text="🔧 开始校准", command=self.start_calibration,
+        ttk.Button(quick_frame, text="开始校准", command=self.start_calibration,
                   style='Primary.TButton').grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(5, 0))
+
+        ttk.Button(quick_frame, text="保护设置", command=self.configure_protection,
+                  style='Warning.TButton').grid(row=0, column=2, sticky=(tk.W, tk.E), padx=(5, 0))
+
+        ttk.Button(quick_frame, text="清除错误码", command=self.clear_all_errors,
+                  style='Danger.TButton').grid(row=0, column=3, sticky=(tk.W, tk.E), padx=(5, 0))
 
     def create_enhanced_joint_status_panel(self, parent):
         """创建增强版关节状态面板"""
@@ -2024,11 +2274,42 @@ class DexterousHandGUI:
         joint_frame.columnconfigure(0, weight=1)
         joint_frame.rowconfigure(0, weight=1)
 
-        # 创建一个容器用于放置所有关节控件
-        container = ttk.Frame(joint_frame, style='Dark.TFrame')
-        container.grid(row=0, column=0, sticky="nsew")
-        joint_frame.columnconfigure(0, weight=1)
-        joint_frame.rowconfigure(0, weight=1)
+        # 创建滚动区域
+        canvas = tk.Canvas(joint_frame, bg='#1e1e1e', highlightthickness=0)
+        scrollbar = ttk.Scrollbar(joint_frame, orient="vertical", command=canvas.yview)
+        container = ttk.Frame(canvas, style='Dark.TFrame')
+        
+        # 绑定配置事件以更新滚动区域
+        container.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        # 创建窗口
+        canvas_window = canvas.create_window((0, 0), window=container, anchor="nw")
+        
+        # 绑定Canvas大小变化以调整container宽度
+        def configure_canvas(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+        canvas.bind('<Configure>', configure_canvas)
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # 绑定鼠标滚轮 (全局绑定可能会影响其他滚动区域，这里尝试绑定到Canvas)
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            
+        # 绑定鼠标进入/离开事件来控制滚轮绑定的生效范围
+        def _bind_mousewheel(event):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        def _unbind_mousewheel(event):
+            canvas.unbind_all("<MouseWheel>")
+            
+        canvas.bind('<Enter>', _bind_mousewheel)
+        canvas.bind('<Leave>', _unbind_mousewheel)
 
         self.joint_widgets = {}
         
@@ -2051,40 +2332,63 @@ class DexterousHandGUI:
             joint_control_frame.grid(row=row, column=col, sticky=(tk.W, tk.E), pady=2, padx=5)
             joint_control_frame.columnconfigure(1, weight=1)
 
-            # 简化布局：所有控件放在一行
-            pos_frame = ttk.Frame(joint_control_frame, style='Dark.TFrame')
-            pos_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
-            pos_frame.columnconfigure(3, weight=1) # 让滑块占据更多空间
-
+            # 简化布局：分为两行
+            # 第一行：状态信息 + 输入框
+            info_frame = ttk.Frame(joint_control_frame, style='Dark.TFrame')
+            info_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+            
+            # 使用pack布局以便利用剩余空间 (一行显示所有状态)
             # 当前位置
             current_pos_var = tk.StringVar(value="0")
-            ttk.Label(pos_frame, textvariable=current_pos_var, style='Status.TLabel', width=12).grid(row=0, column=0, sticky=tk.W)
+            ttk.Label(info_frame, textvariable=current_pos_var, style='Status.TLabel', width=10).pack(side=tk.LEFT, padx=1)
 
             # 当前温度
             current_temp_var = tk.StringVar(value="0°C")
-            ttk.Label(pos_frame, textvariable=current_temp_var, style='Temp.TLabel', width=6).grid(row=0, column=1, sticky=tk.W)
+            ttk.Label(info_frame, textvariable=current_temp_var, style='Temp.TLabel', width=5).pack(side=tk.LEFT, padx=1)
+
+            # 当前电流
+            current_current_var = tk.StringVar(value="0mA")
+            ttk.Label(info_frame, textvariable=current_current_var, style='Status.TLabel', width=8).pack(side=tk.LEFT, padx=1)
+
+            # 错误状态
+            error_status_var = tk.StringVar(value="✅")
+            error_label = ttk.Label(info_frame, textvariable=error_status_var, style='Status.TLabel', width=4)
+            error_label.pack(side=tk.LEFT, padx=1)
+
+            # 关节偏差
+            joint_offset_var = tk.StringVar(value="偏:0")
+            ttk.Label(info_frame, textvariable=joint_offset_var, style='Status.TLabel', width=8).pack(side=tk.LEFT, padx=1)
 
             # 目标位置输入框
             target_pos_var = tk.StringVar(value="0")
-            target_entry = ttk.Entry(pos_frame, textvariable=target_pos_var, width=6, style='Dark.TEntry', justify='center')
-            target_entry.grid(row=0, column=2, padx=5)
+            target_entry = ttk.Entry(info_frame, textvariable=target_pos_var, width=6, style='Dark.TEntry', justify='center')
+            target_entry.pack(side=tk.LEFT, padx=5)
             
-            # 位置滑块
-            position_scale = ttk.Scale(pos_frame, from_=joint.min_pos, to=joint.max_pos, orient=tk.HORIZONTAL,
+            # 第二行：位置滑块
+            scale_frame = ttk.Frame(joint_control_frame, style='Dark.TFrame')
+            scale_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(5, 0))
+            scale_frame.columnconfigure(0, weight=1)
+            
+            position_scale = ttk.Scale(scale_frame, from_=joint.min_pos, to=joint.max_pos, orient=tk.HORIZONTAL,
                                      command=lambda v, jid=joint_id: self.on_scale_change(jid, v))
-            position_scale.grid(row=0, column=3, sticky=(tk.W, tk.E), padx=5)
-            pos_frame.columnconfigure(3, weight=1)
+            position_scale.grid(row=0, column=0, sticky=(tk.W, tk.E))
             
             self.joint_widgets[joint_id] = {
                 'current_pos': current_pos_var,
                 'current_temp': current_temp_var,
+                'current_current': current_current_var,
+                'error_status': error_status_var,
+                'joint_offset': joint_offset_var,
                 'target_pos': target_pos_var,
                 'scale': position_scale,
-                'target_entry': target_entry
+                'target_entry': target_entry,
+                'error_label': error_label
             }
+
             
             target_entry.bind('<Return>', lambda e, jid=joint_id: self.on_target_entry_confirm(jid))
             target_entry.bind('<FocusOut>', lambda e, jid=joint_id: self.on_target_entry_confirm(jid))
+
 
     def create_enhanced_tactile_panel(self, parent):
         """创建增强版触觉传感器面板"""
@@ -2169,26 +2473,44 @@ class DexterousHandGUI:
         control_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(15, 0))
         control_frame.columnconfigure(1, weight=1)  # 中间区域可扩展
         
-        # 左侧按钮组 - 位置操作（一行布局）
-        left_btn_frame = ttk.LabelFrame(control_frame, text="📍 位置操作", style='Dark.TLabelframe', padding="8")
+        # 左侧按钮组 - 位置操作（两行布局）
+        left_btn_frame = ttk.LabelFrame(control_frame, text="📍 位置操作", style='Dark.TLabelframe', padding="5")
         left_btn_frame.grid(row=0, column=0, sticky=(tk.W, tk.N), padx=(0, 10))
         
-        # 所有按钮在一行
-        self.read_current_pos_btn = ttk.Button(left_btn_frame, text="📖 读取到滑块",
+        # 第一行按钮
+        self.read_current_pos_btn = ttk.Button(left_btn_frame, text="读取位置",
                                               command=self.read_current_position, style='Primary.TButton')
-        self.read_current_pos_btn.grid(row=0, column=0, padx=(0, 5))
+        self.read_current_pos_btn.grid(row=0, column=0, padx=2, pady=2)
         
-        self.save_current_pos_btn = ttk.Button(left_btn_frame, text="💾 保存到序列",
+        self.save_current_pos_btn = ttk.Button(left_btn_frame, text="💾保存",
                                               command=self.save_current_position, style='Success.TButton')
-        self.save_current_pos_btn.grid(row=0, column=1, padx=(0, 5))
+        self.save_current_pos_btn.grid(row=0, column=1, padx=2, pady=2)
         
-        self.read_temp_btn = ttk.Button(left_btn_frame, text="🌡️ 读取温度",
+        self.read_temp_btn = ttk.Button(left_btn_frame, text="读取温度",
                                        command=self.read_temperature, style='Primary.TButton')
-        self.read_temp_btn.grid(row=0, column=2, padx=(0, 5))
+        self.read_temp_btn.grid(row=0, column=2, padx=2, pady=2)
         
-        self.run_selected_btn = ttk.Button(left_btn_frame, text="▶️ 执行", 
+        self.read_error_btn = ttk.Button(left_btn_frame, text="读取错误码",
+                                        command=self.read_error_status, style='Warning.TButton')
+        self.read_error_btn.grid(row=0, column=3, padx=2, pady=2)
+        
+        # 第二行按钮
+        self.read_current_btn = ttk.Button(left_btn_frame, text="读取电流",
+                                          command=self.read_motor_current, style='Primary.TButton')
+        self.read_current_btn.grid(row=1, column=0, padx=2, pady=2)
+        
+        self.read_offset_btn = ttk.Button(left_btn_frame, text="📐偏差",
+                                         command=self.read_joint_offset, style='Primary.TButton')
+        self.read_offset_btn.grid(row=1, column=1, padx=2, pady=2)
+        
+        self.set_offset_btn = ttk.Button(left_btn_frame, text="📝设偏",
+                                        command=self.show_offset_editor, style='Warning.TButton')
+        self.set_offset_btn.grid(row=1, column=2, padx=2, pady=2)
+        
+        self.run_selected_btn = ttk.Button(left_btn_frame, text="▶️执行", 
                                           command=self.run_selected_row, style='Primary.TButton')
-        self.run_selected_btn.grid(row=0, column=3)
+        self.run_selected_btn.grid(row=1, column=3, padx=2, pady=2)
+
         
         # 中间参数设置（一行布局）
         param_frame = ttk.LabelFrame(control_frame, text="⚙️ 运行参数", style='Dark.TLabelframe', padding="8")
@@ -2828,6 +3150,240 @@ class DexterousHandGUI:
                 self.device_info_text.delete(1.0, tk.END)
                 self.device_info_text.insert(1.0, device_info)
 
+    def configure_protection(self):
+        """配置过流保护参数 (全局 + 列表详情)"""
+        if not self.controller.comm.is_connected:
+            messagebox.showwarning("警告", "请先连接设备")
+            return
+            
+        dialog = tk.Toplevel(self.root)
+        dialog.title("过流保护配置")
+        dialog.geometry("600x600")
+        dialog.configure(bg='#1e1e1e')
+        
+        # 创建标签页控件
+        style = ttk.Style()
+        style.configure('TNotebook', background='#1e1e1e', borderwidth=0)
+        style.configure('TNotebook.Tab', padding=[10, 5], font=('微软雅黑', 9))
+        
+        notebook = ttk.Notebook(dialog, style='TNotebook')
+        notebook.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # --- 全局配置标签页 ---
+        global_frame = ttk.Frame(notebook, style='Dark.TFrame')
+        notebook.add(global_frame, text='全局统一设置')
+        
+        global_frame.columnconfigure(1, weight=1)
+        
+        ttk.Label(global_frame, text="快速设置所有关节参数 (区分大小电机)", style='Dark.TLabel').grid(row=0, column=0, columnspan=2, pady=10)
+
+        # 定义小电机ID (2, 4, 7, 10, 13, 16)
+        SMALL_MOTORS = [2, 4, 7, 10, 13, 16]
+
+        # 获取默认值 (大电机取电机1，小电机取电机2)
+        default_big_prot = 300
+        default_small_prot = 220
+        default_time = 190
+        
+        if 1 in self.controller.model.joints:
+            val = self.controller.model.joints[1].oc_prot
+            if val > 0: default_big_prot = val
+            val_time = self.controller.model.joints[1].oc_prot_time
+            if val_time > 0: default_time = val_time
+            
+        if 2 in self.controller.model.joints:
+            val = self.controller.model.joints[2].oc_prot
+            if val > 0: default_small_prot = val
+
+        # 大电机电流
+        ttk.Label(global_frame, text="大电机电流阈值 (mA):", style='Dark.TLabel').grid(row=1, column=0, sticky=tk.E, padx=10, pady=5)
+        ttk.Label(global_frame, text="(ID: 1,3,5,6,8,9,11,12,14,15,17)", style='Status.TLabel', font=('微软雅黑', 8)).grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=110)
+        
+        g_big_prot_var = tk.StringVar(value=str(default_big_prot))
+        g_big_prot_entry = ttk.Entry(global_frame, textvariable=g_big_prot_var, style='Dark.TEntry')
+        g_big_prot_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=10, pady=5)
+
+        # 小电机电流
+        ttk.Label(global_frame, text="小电机电流阈值 (mA):", style='Dark.TLabel').grid(row=3, column=0, sticky=tk.E, padx=10, pady=5)
+        ttk.Label(global_frame, text="(ID: 2,4,7,10,13,16)", style='Status.TLabel', font=('微软雅黑', 8)).grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=110)
+
+        g_small_prot_var = tk.StringVar(value=str(default_small_prot))
+        g_small_prot_entry = ttk.Entry(global_frame, textvariable=g_small_prot_var, style='Dark.TEntry')
+        g_small_prot_entry.grid(row=3, column=1, sticky=(tk.W, tk.E), padx=10, pady=5)
+        
+        # 保护时间 (统一)
+        ttk.Label(global_frame, text="统一保护时间 (ms):", style='Dark.TLabel').grid(row=5, column=0, sticky=tk.E, padx=10, pady=15)
+        g_time_var = tk.StringVar(value=str(default_time))
+        g_time_entry = ttk.Entry(global_frame, textvariable=g_time_var, style='Dark.TEntry')
+        g_time_entry.grid(row=5, column=1, sticky=(tk.W, tk.E), padx=10, pady=15)
+        
+        # 全局按钮
+        g_btn_frame = ttk.Frame(global_frame, style='Dark.TFrame')
+        g_btn_frame.grid(row=6, column=0, columnspan=2, pady=20)
+        
+        def read_global():
+            # 发送读取命令
+            self.controller._read_oc_protection()
+            self.controller._read_oc_protection_time()
+            
+            def update_ui():
+                # 大电机参考电机1
+                if 1 in self.controller.model.joints:
+                    joint = self.controller.model.joints[1]
+                    g_big_prot_var.set(str(joint.oc_prot))
+                    g_time_var.set(str(joint.oc_prot_time))
+                
+                # 小电机参考电机2
+                if 2 in self.controller.model.joints:
+                    joint = self.controller.model.joints[2]
+                    g_small_prot_var.set(str(joint.oc_prot))
+                
+                dialog.title("过流保护配置 - 读取完成")
+            
+            dialog.title("过流保护配置 - 读取中...")
+            dialog.after(800, update_ui)
+            
+        def save_global():
+            try:
+                big_prot = int(g_big_prot_var.get())
+                small_prot = int(g_small_prot_var.get())
+                time_val = int(g_time_var.get())
+                
+                prots = []
+                times = [time_val] * 17
+                
+                for i in range(1, 18):
+                    if i in SMALL_MOTORS:
+                        prots.append(small_prot)
+                    else:
+                        prots.append(big_prot)
+                
+                s1 = self.controller.set_oc_protection(prots)
+                s2 = self.controller.set_oc_protection_time(times)
+                
+                if s1 and s2:
+                    messagebox.showinfo("成功", "全局参数已下发 (区分大小电机)")
+                else:
+                    messagebox.showwarning("提示", "参数下发完成，但可能部分写入失败")
+            except ValueError:
+                messagebox.showerror("错误", "请输入有效的数字")
+
+        ttk.Button(g_btn_frame, text="读取配置", command=read_global, style='Primary.TButton').pack(side=tk.LEFT, padx=5)
+        ttk.Button(g_btn_frame, text="应用到所有关节", command=save_global, style='Success.TButton').pack(side=tk.LEFT, padx=5)
+
+        # 自动读取配置
+        dialog.after(100, read_global)
+
+
+        # --- 列表配置标签页 ---
+        list_frame = ttk.Frame(notebook, style='Dark.TFrame')
+        notebook.add(list_frame, text='各关节详细设置')
+        
+        # 底部按钮区
+        l_btn_frame = ttk.Frame(list_frame, style='Dark.TFrame')
+        l_btn_frame.pack(side="bottom", fill="x", pady=10)
+        
+        # 列表滚动区
+        list_container = ttk.Frame(list_frame, style='Dark.TFrame')
+        list_container.pack(side="top", fill="both", expand=True)
+        
+        canvas = tk.Canvas(list_container, bg='#1e1e1e', highlightthickness=0)
+        scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
+        scroll_content = ttk.Frame(canvas, style='Dark.TFrame')
+        
+        scroll_content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_content, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # 列表表头
+        ttk.Label(scroll_content, text="关节名称", style='Dark.TLabel', font=('微软雅黑', 9, 'bold')).grid(row=0, column=0, padx=10, pady=5, sticky=tk.W)
+        ttk.Label(scroll_content, text="电流阈值 (mA)", style='Dark.TLabel', font=('微软雅黑', 9, 'bold')).grid(row=0, column=1, padx=5, pady=5)
+        ttk.Label(scroll_content, text="保护时间 (ms)", style='Dark.TLabel', font=('微软雅黑', 9, 'bold')).grid(row=0, column=2, padx=5, pady=5)
+        
+        self.list_prot_entries = {}
+        self.list_time_entries = {}
+        
+        # 填充列表
+        current_row = 1
+        for joint in JOINT_DEFINITIONS:
+            motor_id = joint.id
+            
+            # Label
+            name_txt = f"{motor_id}: {joint.finger}-{joint.name}"
+            ttk.Label(scroll_content, text=name_txt, style='Dark.TLabel').grid(row=current_row, column=0, padx=10, pady=2, sticky=tk.W)
+            
+            # Initial values
+            pv = 220
+            tv = 110
+            if motor_id in self.controller.model.joints:
+                j = self.controller.model.joints[motor_id]
+                pv = j.oc_prot
+                tv = j.oc_prot_time
+            
+            # Prot Entry
+            p_var = tk.StringVar(value=str(pv))
+            p_entry = ttk.Entry(scroll_content, textvariable=p_var, width=12, style='Dark.TEntry', justify='center')
+            p_entry.grid(row=current_row, column=1, padx=5, pady=2)
+            self.list_prot_entries[motor_id] = p_var
+            
+            # Time Entry
+            t_var = tk.StringVar(value=str(tv))
+            t_entry = ttk.Entry(scroll_content, textvariable=t_var, width=12, style='Dark.TEntry', justify='center')
+            t_entry.grid(row=current_row, column=2, padx=5, pady=2)
+            self.list_time_entries[motor_id] = t_var
+            
+            current_row += 1
+            
+        
+        # 列表底部按钮逻辑
+        def refresh_list_values():
+            self.controller._read_oc_protection()
+            self.controller._read_oc_protection_time()
+            
+            def update_ui():
+                count = 0
+                for mid, p_var in self.list_prot_entries.items():
+                    if mid in self.controller.model.joints:
+                        p_var.set(str(self.controller.model.joints[mid].oc_prot))
+                        count += 1
+                for mid, t_var in self.list_time_entries.items():
+                    if mid in self.controller.model.joints:
+                        t_var.set(str(self.controller.model.joints[mid].oc_prot_time))
+                dialog.title(f"过流保护配置 - 已更新 {count} 个关节数据")
+                
+            dialog.after(800, update_ui)
+            dialog.title("过流保护配置 - 读取中...")
+            
+        def apply_list_values():
+            try:
+                # Prepare arrays
+                prots = [220] * 17
+                times = [110] * 17
+                
+                # JOINT_DEFINITIONS has 17 items. i=0->motor 1
+                for i in range(17):
+                    mid = i + 1
+                    if mid in self.list_prot_entries:
+                        prots[i] = int(self.list_prot_entries[mid].get())
+                    if mid in self.list_time_entries:
+                        times[i] = int(self.list_time_entries[mid].get())
+                
+                s1 = self.controller.set_oc_protection(prots)
+                s2 = self.controller.set_oc_protection_time(times)
+                
+                if s1 and s2:
+                    messagebox.showinfo("成功", "所有关节参数已下发")
+                else:
+                    messagebox.showwarning("警告", "参数下发未完全成功")
+            except ValueError:
+                messagebox.showerror("错误", "输入格式有误，请确保都是数字")
+
+        ttk.Button(l_btn_frame, text="从设备读取最新", command=refresh_list_values, style='Primary.TButton').pack(side=tk.LEFT, padx=10)
+        ttk.Button(l_btn_frame, text="应用所有修改", command=apply_list_values, style='Success.TButton').pack(side=tk.LEFT, padx=10)
+
     def start_gui_update(self):
         """开始GUI更新"""
         self.update_counter = 0
@@ -2885,7 +3441,45 @@ class DexterousHandGUI:
                 elif joint.current_temp > 45:
                     widgets['current_temp'].set(f"⚠️ {joint.current_temp}°C")
 
+                # 更新当前电流显示
+                if 'current_current' in widgets:
+                    current_text = f"{joint.current_current}mA"
+                    widgets['current_current'].set(current_text)
+
+                # 更新错误状态显示
+                if 'error_status' in widgets:
+                    error_code = joint.error_status
+                    if error_code == 0:
+                        widgets['error_status'].set("✅")
+                        # 恢复正常样式 (需要在create_widgets中保存widget引用，目前只能通过父类遍历或重新查找，但这里widget是Label)
+                        # 为了支持样式修改，我们需要在joint_widgets中保存label控件的引用
+                        # 这里我们假设joint_widgets['error_label']保存了label引用
+                        if 'error_label' in widgets:
+                             widgets['error_label'].configure(style='Status.TLabel')
+                    else:
+                        if error_code == 1:
+                            widgets['error_status'].set("堵转")
+                        elif error_code == 2:
+                            widgets['error_status'].set("⚡过流")
+                        elif error_code == 3:
+                            widgets['error_status'].set("📡通讯")
+                        elif error_code == 4:
+                            widgets['error_status'].set("🔧未校准")
+                        else:
+                            widgets['error_status'].set(f"❌{error_code}")
+                        
+                        # 设置错误样式（红色）
+                        if 'error_label' in widgets:
+                             widgets['error_label'].configure(style='Error.TLabel')
+
+                # 更新关节偏差显示
+                if 'joint_offset' in widgets:
+                    offset = joint.joint_offset
+                    angle_deg = offset * POSITION_UNIT
+                    widgets['joint_offset'].set(f"偏:{offset}({angle_deg:.1f}°)")
+
     def create_context_menu(self):
+
         """创建右键菜单"""
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(label="✏️ 编辑单元格", command=self.edit_selected_cell)
@@ -2994,7 +3588,173 @@ class DexterousHandGUI:
         self.status_var.set("⏳ 正在读取温度...")
         # 接收线程会自动更新模型，GUI循环会自动刷新显示
 
+    def read_error_status(self):
+        """手动读取错误状态并更新UI"""
+        if not self.controller.comm.is_connected:
+            self.status_var.set("❌ 设备未连接")
+            return
+        
+        print("⚠️ 发送错误状态读取请求...")
+        self.controller._read_error_status()
+        self.status_var.set("⏳ 正在读取错误状态...")
+        # 接收线程会自动更新模型，GUI循环会自动刷新显示
+
+    def read_motor_current(self):
+        """手动读取电机电流并更新UI"""
+        if not self.controller.comm.is_connected:
+            self.status_var.set("❌ 设备未连接")
+            return
+        
+        print("⚡ 发送电流读取请求...")
+        self.controller._read_motor_currents()
+        self.status_var.set("⏳ 正在读取电流...")
+        # 接收线程会自动更新模型，GUI循环会自动刷新显示
+
+    def read_joint_offset(self):
+        """手动读取关节位置偏差并更新UI"""
+        if not self.controller.comm.is_connected:
+            self.status_var.set("❌ 设备未连接")
+            return
+        
+        print("📐 发送偏差读取请求...")
+        self.controller._read_joint_offsets()
+        self.status_var.set("⏳ 正在读取偏差...")
+
+        # 接收线程会自动更新模型
+
+    def clear_all_errors(self):
+        """清除所有错误"""
+        if not self.controller.comm.is_connected:
+            self.status_var.set("❌ 设备未连接")
+            return
+            
+        if self.controller.clear_error_status():
+            self.status_var.set("🧹 已发送清除错误命令")
+            # 200ms后自动读取最新错误状态
+            self.root.after(200, self.read_error_status)
+        else:
+            self.status_var.set("❌ 清除错误失败")
+
+    def show_offset_editor(self):
+        """显示关节位置偏差编辑器"""
+        if not self.controller.comm.is_connected:
+            messagebox.showwarning("警告", "请先连接设备")
+            return
+        
+        # 先读取当前偏差
+        print("📐 读取当前偏差...")
+        self.controller._read_joint_offsets()
+        
+        # 等待200ms后显示编辑器
+        self.root.after(200, self._show_offset_editor_window)
+
+    def _show_offset_editor_window(self):
+        """显示偏差编辑器窗口"""
+        # 创建偏差编辑窗口
+        edit_window = tk.Toplevel(self.root)
+        edit_window.title("关节位置偏差编辑器")
+        edit_window.geometry("700x600")
+        edit_window.configure(bg='#1e1e1e')
+        
+        # 创建滚动框架
+        canvas = tk.Canvas(edit_window, bg='#1e1e1e', highlightthickness=0)
+        scrollbar = ttk.Scrollbar(edit_window, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas, style='Dark.TFrame')
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # 标题说明
+        ttk.Label(scrollable_frame, text="关节位置偏差设置 (单位: 0.087度)", 
+                 style='Header.TLabel').grid(row=0, column=0, columnspan=3, pady=10, padx=10)
+        
+        ttk.Label(scrollable_frame, text="偏差值用于补偿机械公差，写入后自动保存到Flash", 
+                 style='Status.TLabel').grid(row=1, column=0, columnspan=3, pady=(0, 10), padx=10)
+        
+        # 存储偏差输入变量
+        offset_vars = {}
+        
+        # 获取当前偏差
+        current_offsets = self.controller.model.get_all_joint_offsets()
+        
+        # 为每个关节创建偏差输入
+        for i, joint in enumerate(JOINT_DEFINITIONS):
+            row = i + 2
+            
+            # 关节名称
+            ttk.Label(scrollable_frame, text=f"{joint.finger} - {joint.name}", 
+                     style='Dark.TLabel', width=20).grid(row=row, column=0, sticky=tk.W, padx=10, pady=3)
+            
+            # 当前偏差值
+            current_offset = current_offsets[i] if i < len(current_offsets) else 0
+            offset_var = tk.StringVar(value=str(current_offset))
+            offset_vars[joint.id] = offset_var
+            
+            offset_entry = ttk.Entry(scrollable_frame, textvariable=offset_var, width=10, 
+                                    style='Dark.TEntry', justify='center')
+            offset_entry.grid(row=row, column=1, padx=10, pady=3)
+            
+            # 显示角度值
+            angle_deg = current_offset * POSITION_UNIT
+            angle_label = ttk.Label(scrollable_frame, text=f"≈ {angle_deg:.2f}°", 
+                                   style='Status.TLabel', width=12)
+            angle_label.grid(row=row, column=2, sticky=tk.W, padx=10, pady=3)
+        
+        scrollable_frame.columnconfigure(0, weight=1)
+        scrollable_frame.columnconfigure(1, weight=1)
+        scrollable_frame.columnconfigure(2, weight=1)
+        
+        def save_offsets():
+            """保存偏差到设备"""
+            try:
+                offsets = []
+                for i in range(17):
+                    joint_id = i + 1
+                    if joint_id in offset_vars:
+                        try:
+                            offset = int(offset_vars[joint_id].get())
+                        except ValueError:
+                            offset = 0
+                        offsets.append(offset)
+                    else:
+                        offsets.append(0)
+                
+                print(f"📝 准备写入偏差: {offsets}")
+                
+                if self.controller.set_joint_offsets(offsets):
+                    messagebox.showinfo("成功", "关节偏差已保存到Flash")
+                    edit_window.destroy()
+                else:
+                    messagebox.showerror("错误", "保存偏差失败")
+            except Exception as e:
+                messagebox.showerror("错误", f"保存偏差时发生错误: {e}")
+        
+        def reset_offsets():
+            """重置所有偏差为0"""
+            for var in offset_vars.values():
+                var.set("0")
+        
+        # 按钮框架
+        button_frame = ttk.Frame(scrollable_frame, style='Dark.TFrame')
+        button_frame.grid(row=len(JOINT_DEFINITIONS) + 3, column=0, columnspan=3, pady=20)
+        
+        ttk.Button(button_frame, text="💾 保存到设备", command=save_offsets, 
+                  style='Success.TButton').pack(side=tk.LEFT, padx=10)
+        ttk.Button(button_frame, text="🔄 全部归零", command=reset_offsets, 
+                  style='Warning.TButton').pack(side=tk.LEFT, padx=10)
+        ttk.Button(button_frame, text="❌ 取消", command=edit_window.destroy, 
+                  style='Danger.TButton').pack(side=tk.LEFT, padx=10)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
     def save_current_position(self):
+
         """保存当前位置到动作序列"""
         if not self.controller.comm.is_connected:
             self.status_var.set("❌ 设备未连接")

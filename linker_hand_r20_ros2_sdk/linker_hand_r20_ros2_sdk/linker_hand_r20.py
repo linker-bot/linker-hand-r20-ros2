@@ -25,29 +25,52 @@ class LinkerHandR20(Node):
         self.hand_joint = self.get_parameter('hand_joint').value
         # ros时间获取
         self.stamp_clock = Clock()
+        self.info_dic = {
+                "current_temp": [-1] * 20,
+                "current_current": [-1] * 20,
+                "error_status": [-1] * 20,
+            }
         self.ctl = DexterousHandController()
+        self._init_hand()
+        
+        
+        self.run_thread = threading.Thread(target=self._run, daemon=True)
+        self.run_thread.start()
+        if self.ctl.comm.is_connected:
+            self.get_logger().info("Linker Hand 连接成功！")
+        else:
+            self.get_logger().error("Linker Hand 连接失败！")
+
+    def _init_hand(self): 
+        self.get_logger().info("正在初始化...")
         self.ctl.connect() # 连接设备
+        if self.ctl.comm.query_device_type() == "左手":
+            self.hand_type = "left"
+        elif self.ctl.comm.query_device_type() == "右手":
+            self.hand_type = "right"
         self.ctl.start_monitoring() # 开启监听线程
+        time.sleep(0.1)
+        device_info = self.ctl.read_serial_number()
+        self.out_info(info_dic=device_info)
         self.hand_cmd_sub = self.create_subscription(JointState, f'/cb_{self.hand_type}_hand_control_cmd', self.hand_control_cb,10)
         self.hand_state_pub = self.create_publisher(JointState, f'/cb_{self.hand_type}_hand_state',10)
         self.hand_state_arc_pub = self.create_publisher(JointState, f'/cb_{self.hand_type}_hand_state_arc',10)
         self.hand_info_pub = self.create_publisher(String, f'/cb_{self.hand_type}_hand_info', 10)
         self.motor_list = None
         self.position_to_motor_map = [0, 15, 5, 10, 6, 1, 16, 7, 2, 17, 8, 11, 12, 13, 14, 3, 18, 9, 4, 19]
-        self.run_thread = threading.Thread(target=self._run, daemon=True)
-        self.run_thread.start()
-        if self.ctl.comm.is_connected:
-            self.get_logger().info("Linker Hand R20 ROS2 SDK 连接成功")
-        else:
-            self.get_logger().error("Linker Hand R20 ROS2 SDK 连接失败")
-
+        # 五指张开
+        self.ctl.set_joint_positions([0] * 17)
+        time.sleep(0.1)
+        # 开始校准
+        self.ctl.set_calibration_mode(1)
+        time.sleep(1)
 
     def validate_strict_non_negative_ints(self, lst):
         """校验：所有元素必须是 int 类型，且 >= 0（排除 bool/str/float/负数）"""
         if len(lst) != 20:
             return False
         else:
-            return all(type(x) is int and x >= 0 for x in lst)
+            return all(type(x) in (int, float) and x >= 0 for x in lst)
 
     def hand_control_cb(self, msg):
         position = list(msg.position)
@@ -88,28 +111,59 @@ class LinkerHandR20(Node):
         return [src[map_table[i]] for i in range(len(map_table))]
     
     def _run(self):
+        info_msg = String()
         while True:
             if self.motor_list != None:
                 self.ctl.set_joint_positions(self.motor_list+[0])
-                time.sleep(0.05)
+                time.sleep(0.02)
                 self.motor_list = None
             
-            tmp_range=[]
-            tmp_angle = []
+            tmp_range=[] # position范围值
+            tmp_angle = [] # position角度值
+            tmp_vel = [] # 当前电机速度
+            tmp_current_temp = [] # 当前温度值
+            tmp_current_current = [] # 当前电流值
+            tmp_error_status = [] # 当前电机错误码
             for k, v in self.ctl.model.joints.items():
                 if k < 17:
                     # print(f"K:{k} V:{v}", flush=True)
+                    # 当前position
                     tmp_angle.append(v.current_pos)
                     tmp_range.append(self.to_uint8(v.current_pos, v.min_pos, v.max_pos))
+                    # 当前电机速度
+                    tmp_vel.append(v.current_vel)
+                    # 当前温度
+                    tmp_current_temp.append(v.current_temp)
+                    # 当前电流
+                    tmp_current_current.append(v.current_current)
+                    # 当前错误码
+                    tmp_error_status.append(v.error_status)
             # 按照映射表重排为位置顺序motor→position_cmd
             state_range = self.reorder_by_map(tmp_range[:11] + [0, 0, 0, 0] + tmp_range[11:], self.position_to_motor_map, reverse=True)
-            
             state_angle = self.reorder_by_map(tmp_angle[:11] + [0, 0, 0, 0] + tmp_angle[11:], self.position_to_motor_map, reverse=True)
-            state_range_msg = self.joint_state_msg(pose=state_range)
-            state_angle_msg = self.joint_state_msg(pose=state_angle)
+            ve = tmp_vel[:11] + [0, 0, 0, 0] + tmp_vel[11:]
+            state_vel = [ve[i] for i in self.position_to_motor_map]
+            state_range_msg = self.joint_state_msg(pose=state_range, vel=state_vel)
+            state_angle_msg = self.joint_state_msg(pose=state_angle, vel=state_vel)
+
+            # 温度数据填充
+            c_t = tmp_current_temp[:11] + [0, 0, 0, 0] + tmp_current_temp[11:]
+            # 按照映射表进行数据映射
+            self.info_dic["current_temp"] = [c_t[i] for i in self.position_to_motor_map]
+
+            # 当前电流值数据填充
+            c_c = tmp_current_current[:11] + [0, 0, 0, 0] + tmp_current_current[11:]
+            # 按照映射表电流数据映射
+            self.info_dic["current_current"] = [c_c[i] for i in self.position_to_motor_map]
+
+            #当前错误码数据填充
+            e_s = tmp_error_status[:11] + [0, 0, 0, 0] + tmp_error_status[11:]
+            self.info_dic["error_status"] = [e_s[i] for i in self.position_to_motor_map]
+            info_msg.data = json.dumps(self.info_dic)
             self.hand_state_pub.publish(state_range_msg)
             self.hand_state_arc_pub.publish(state_angle_msg)
-            time.sleep(0.05)
+            self.hand_info_pub.publish(info_msg)
+            time.sleep(0.02)
 
     def joint_state_msg(self, pose,vel=[]):
         joint_state = JointState()
@@ -128,7 +182,22 @@ class LinkerHandR20(Node):
         return joint_state
         
 
+    def out_info(self,info_dic):
+        from rich.console import Console
+        from rich.table import Table, box
 
+        console = Console()
+        table = Table(title="Linker Hand", box=box.ROUNDED)
+
+        table.add_column("product_model", style="cyan", justify="center")
+        table.add_column("serial_number", style="cyan", justify="center") 
+        table.add_column("software_version", style="magenta", justify="center")
+        table.add_column("hardware_version", style="magenta", justify="center")
+        table.add_column("hand_type", style="magenta", justify="center")
+        table.add_column("unique_id", style="magenta", justify="center")
+
+        table.add_row(str(info_dic["product_model"]), str(info_dic["serial_number"]), str(info_dic["software_version"]),str(info_dic["hardware_version"]),str(self.hand_type),str(info_dic["unique_id"]))
+        console.print(table)
 
 def main(args=None):
     rclpy.init(args=args)
