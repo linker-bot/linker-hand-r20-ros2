@@ -80,7 +80,7 @@ class LinkerHandR20(Node):
     def hand_control_cb(self, msg):
         position = list(msg.position)
         if not self.validate_strict_non_negative_ints(position):
-            self.get_logger().error("hand_control_cmd topic 输入的位置值不合法,请检查输入值是否为整数且大于等于0, 长度为20")
+            self.get_logger().error("hand_control_cmd topic 输入的位置值不合法,请检查输入值是否为整数且大于等于0,且小于等于255, 长度为20")
             self.motor_list = None
         else:
             tmp_list = [position[i] for i in self.position_to_motor_map]
