@@ -66,11 +66,16 @@ class LinkerHandR20(Node):
         time.sleep(1)
 
     def validate_strict_non_negative_ints(self, lst):
-        """校验：所有元素必须是 int 类型，且 >= 0（排除 bool/str/float/负数）"""
+        """校验：所有元素必须是 int 类型，且 0 <= x <= 255（排除 bool/str/float/负数/超255）"""
         if len(lst) != 20:
             return False
         else:
-            return all(type(x) in (int, float) and x >= 0 for x in lst)
+            return all(
+                type(x) is int and  # 严格 int 类型（排除 bool/float）
+                not isinstance(x, bool) and  # 再次确保排除 bool
+                0 <= x <= 255  # 范围限制在 0-255
+                for x in lst
+            )
 
     def hand_control_cb(self, msg):
         position = list(msg.position)
