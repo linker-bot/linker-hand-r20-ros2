@@ -66,16 +66,19 @@ class LinkerHandR20(Node):
         time.sleep(1)
 
     def validate_strict_non_negative_ints(self, lst):
-        """校验：所有元素必须是 int 类型，且 0 <= x <= 255（排除 bool/str/float/负数/超255）"""
-        if len(lst) != 20:
-            return False
-        else:
+        """校验：所有元素必须是 int 或 float 类型，且 0 < x <= 255（排除 bool/字符串/负数/0/超255）"""
+        try:
+            if len(lst) != 20:
+                return False
             return all(
-                type(x) is int and  # 严格 int 类型（排除 bool/float）
-                not isinstance(x, bool) and  # 再次确保排除 bool
-                0 <= x <= 255  # 范围限制在 0-255
+                isinstance(x, (int, float)) and  # 接受 int 或 float 类型
+                not isinstance(x, bool) and  # 排除 bool
+                0 <= x <= 255  # 范围限制在 0-255（包括0）
                 for x in lst
             )
+        except Exception as e:
+            self.get_logger().error(f"验证位置数据时发生异常: {e}")
+            return False
 
     def hand_control_cb(self, msg):
         position = list(msg.position)
