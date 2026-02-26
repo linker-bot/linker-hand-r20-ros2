@@ -34,8 +34,8 @@ class LinkerHandR20(Node):
         self._init_hand()
         
         
-        self.run_thread = threading.Thread(target=self._run, daemon=True)
-        self.run_thread.start()
+        #self.run_thread = threading.Thread(target=self._run, daemon=True)
+        #self.run_thread.start()
         if self.ctl.comm.is_connected:
             self.get_logger().info("Linker Hand 连接成功！")
         else:
@@ -118,7 +118,7 @@ class LinkerHandR20(Node):
 
         return [src[map_table[i]] for i in range(len(map_table))]
     
-    def _run(self):
+    def run(self):
         info_msg = String()
         while True:
             if self.motor_list != None:
@@ -211,8 +211,8 @@ def main(args=None):
     rclpy.init(args=args)
     node = LinkerHandR20()
     try:
-        #node.run()
-        rclpy.spin(node)         # 主循环，监听 ROS 回调
+        node.run()
+        #rclpy.spin(node)         # 主循环，监听 ROS 回调
     except KeyboardInterrupt:
         print("收到 Ctrl+C，准备退出...")
     finally:      # 关闭 CAN 或其他硬件资源
