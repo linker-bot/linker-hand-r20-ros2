@@ -611,7 +611,7 @@ class CANFDCommunication:
                     if data_len > 0:
                         print(f"        数据内容: {data.hex().upper()}")
                 return True
-            else:
+            elif ret < 0:
                 print(f"     ❌ 发送失败:")
                 print(f"        寄存器: 0x{register_addr:02X}")
                 print(f"        返回值: {ret}")
