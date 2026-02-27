@@ -566,7 +566,7 @@ class CANFDCommunication:
             print(f"     调试: 发送帧 -> ID:0x{frame_id:08X}, DLC:{dlc}, 数据预览:{sent_data_preview.hex().upper()}")
             ret = self.canDLL.CANFD_Transmit(0, self.channel, byref(msg), 1, 200)
             print(f"     调试: CANFD_Transmit 返回: {ret}")
-            if ret == 1:
+            if ret >= 1:
                 # 根据寄存器类型显示不同的详细信息
                 if register_addr == RegisterAddress.SYS_TARGET_POS.value:
                     print(f"     ✅ 位置命令发送成功:")
@@ -611,7 +611,7 @@ class CANFDCommunication:
                     if data_len > 0:
                         print(f"        数据内容: {data.hex().upper()}")
                 return True
-            elif ret < 0:
+            elif ret <= 0:
                 print(f"     ❌ 发送失败:")
                 print(f"        寄存器: 0x{register_addr:02X}")
                 print(f"        返回值: {ret}")
