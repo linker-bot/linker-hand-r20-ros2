@@ -3,6 +3,7 @@
 import rclpy,time, threading, json, sys
 from typing import List
 from rclpy.node import Node
+import numpy as np
 from rclpy.clock import Clock
 from std_msgs.msg import String
 from std_msgs.msg import String, Header, Float32MultiArray
@@ -30,12 +31,12 @@ class LinkerHandR20(Node):
                 "current_current": [-1] * 20,
                 "error_status": [-1] * 20,
             }
-        self.ctl = DexterousHandController()
+        self.ctl = DexterousHandController(hand_type=self.hand_type)
         self._init_hand()
         
         
-        #self.run_thread = threading.Thread(target=self._run, daemon=True)
-        #self.run_thread.start()
+        self.run_thread = threading.Thread(target=self._run, daemon=True)
+        self.run_thread.start()
         if self.ctl.comm.is_connected:
             self.get_logger().info("Linker Hand 连接成功！")
         else:
@@ -55,6 +56,7 @@ class LinkerHandR20(Node):
         self.hand_cmd_sub = self.create_subscription(JointState, f'/cb_{self.hand_type}_hand_control_cmd', self.hand_control_cb,10)
         self.hand_state_pub = self.create_publisher(JointState, f'/cb_{self.hand_type}_hand_state',10)
         self.hand_state_arc_pub = self.create_publisher(JointState, f'/cb_{self.hand_type}_hand_state_arc',10)
+        self.matrix_touch_pub = self.create_publisher(String, f'/cb_{self.hand_type}_hand_matrix_touch', 10)
         self.hand_info_pub = self.create_publisher(String, f'/cb_{self.hand_type}_hand_info', 10)
         self.motor_list = None
         self.position_to_motor_map = [0, 15, 5, 10, 6, 1, 16, 7, 2, 17, 8, 11, 12, 13, 14, 3, 18, 9, 4, 19]
@@ -118,7 +120,7 @@ class LinkerHandR20(Node):
 
         return [src[map_table[i]] for i in range(len(map_table))]
     
-    def run(self):
+    def _run(self):
         info_msg = String()
         while True:
             if self.motor_list != None:
@@ -132,6 +134,7 @@ class LinkerHandR20(Node):
             tmp_current_temp = [] # 当前温度值
             tmp_current_current = [] # 当前电流值
             tmp_error_status = [] # 当前电机错误码
+            tmp_touch_data = [] # 当前压力传感器
             for k, v in self.ctl.model.joints.items():
                 if k < 17:
                     # print(f"K:{k} V:{v}", flush=True)
@@ -146,6 +149,8 @@ class LinkerHandR20(Node):
                     tmp_current_current.append(v.current_current)
                     # 当前错误码
                     tmp_error_status.append(v.error_status)
+            
+            
             # 按照映射表重排为位置顺序motor→position_cmd
             state_range = self.reorder_by_map(tmp_range[:11] + [0, 0, 0, 0] + tmp_range[11:], self.position_to_motor_map, reverse=True)
             state_angle = self.reorder_by_map(tmp_angle[:11] + [0, 0, 0, 0] + tmp_angle[11:], self.position_to_motor_map, reverse=True)
@@ -171,7 +176,30 @@ class LinkerHandR20(Node):
             self.hand_state_pub.publish(state_range_msg)
             self.hand_state_arc_pub.publish(state_angle_msg)
             self.hand_info_pub.publish(info_msg)
+
+            matrix_touch_msg = String()
+            tactile_data_native = self.convert_to_native(self.ctl.model.tactile_data)
+            matrix_touch_msg.data = json.dumps(tactile_data_native)
+            self.matrix_touch_pub.publish(matrix_touch_msg)
             time.sleep(0.02)
+
+
+    def convert_to_native(self, obj):
+        """
+        递归转换 numpy 类型为 Python 原生类型
+        """
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.integer, np.int32, np.int64, np.uint8)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, dict):
+            return {k: self.convert_to_native(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [self.convert_to_native(item) for item in obj]
+        else:
+            return obj
 
     def joint_state_msg(self, pose,vel=[]):
         joint_state = JointState()
@@ -211,8 +239,8 @@ def main(args=None):
     rclpy.init(args=args)
     node = LinkerHandR20()
     try:
-        node.run()
-        #rclpy.spin(node)         # 主循环，监听 ROS 回调
+        #node.run()
+        rclpy.spin(node)         # 主循环，监听 ROS 回调
     except KeyboardInterrupt:
         print("收到 Ctrl+C，准备退出...")
     finally:      # 关闭 CAN 或其他硬件资源

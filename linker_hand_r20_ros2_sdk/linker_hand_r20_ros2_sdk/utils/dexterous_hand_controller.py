@@ -26,9 +26,10 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import numpy as np
 from datetime import datetime
+#from tactile_window import TactileSensorWindow
 
 # 添加python3.11目录到路径
-# sys.path.append(os.path.join(os.path.dirname(__file__), 'python3.11'))
+#sys.path.append(os.path.join(os.path.dirname(__file__), 'python3.11'))
 
 # 导入CANFD库
 from ctypes import *
@@ -127,6 +128,13 @@ class JointInfo:
     config_status: int = 0
     oc_prot: int = 220  # 过流保护阈值 (mA)
     oc_prot_time: int = 110  # 过流保护时间 (ms)
+    tactile_data = {
+            'thumb': np.zeros((6, 12)),
+            'index': np.zeros((6, 12)),
+            'middle': np.zeros((6, 12)),
+            'ring': np.zeros((6, 12)),
+            'pinky': np.zeros((6, 12))
+        }
 
 # 手指关节定义 - 按照协议规范v2.0的电机ID分配
 JOINT_DEFINITIONS = [
@@ -163,8 +171,8 @@ JOINT_DEFINITIONS = [
 class CANFDCommunication:
     """CANFD通信类"""
 
-    def __init__(self):
-        # # 根据Python架构选择对应的DLL
+    def __init__(self,hand_type="right"):
+        # 根据Python架构选择对应的DLL
         # import platform
         # arch = platform.architecture()[0]
         # if arch == '64bit':
@@ -175,6 +183,7 @@ class CANFDCommunication:
         #         self.dll_path = os.path.join(os.path.dirname(__file__), 'python3.11', 'hcanbus.dll')
         # else:
         #     self.dll_path = os.path.join(os.path.dirname(__file__), 'python3.11', 'hcanbus.dll')
+        self.hand_type=hand_type
         self.canDLL = None
         self.channel = 0
         self.device_id = DeviceID.RIGHT_HAND.value
@@ -194,7 +203,6 @@ class CANFDCommunication:
             # # 加载DLL
             # print(f"加载CANFD库: {self.dll_path}")
             # self.canDLL = windll.LoadLibrary(self.dll_path)
-
             CDLL("/usr/local/lib/libusb-1.0.so", RTLD_GLOBAL)
             time.sleep(0.1)  # 确保库加载完成
             self.canDLL = cdll.LoadLibrary("/usr/local/lib/libcanbus.so")  #动态库路径
@@ -343,15 +351,16 @@ class CANFDCommunication:
             return None
 
         print("🔍 正在查询设备类型...")
-
+        right_hand_response = None
+        left_hand_response = None
         # 尝试查询右手设备
-        print("   查询右手设备 (ID: 0x01)...")
-        right_hand_response = self._query_single_device(DeviceID.RIGHT_HAND.value)
-
-        # 尝试查询左手设备
-        print("   查询左手设备 (ID: 0x02)...")
-        left_hand_response = self._query_single_device(DeviceID.LEFT_HAND.value)
-
+        if self.hand_type == "right":
+            print("   查询右手设备 (ID: 0x01)...")
+            right_hand_response = self._query_single_device(DeviceID.RIGHT_HAND.value)
+        if self.hand_type == "left":
+            # 尝试查询左手设备
+            print("   查询左手设备 (ID: 0x02)...")
+            left_hand_response = self._query_single_device(DeviceID.LEFT_HAND.value)
         # 分析响应结果
         if right_hand_response and left_hand_response:
             print("⚠️ 检测到左右手设备都有响应，默认选择右手")
@@ -555,7 +564,7 @@ class CANFDCommunication:
             except Exception:
                 sent_data_preview = bytes(data_array[:])
             print(f"     调试: 发送帧 -> ID:0x{frame_id:08X}, DLC:{dlc}, 数据预览:{sent_data_preview.hex().upper()}")
-            ret = self.canDLL.CANFD_Transmit(0, self.channel, byref(msg), 1, 100)
+            ret = self.canDLL.CANFD_Transmit(0, self.channel, byref(msg), 1, 200)
             print(f"     调试: CANFD_Transmit 返回: {ret}")
             if ret == 1:
                 # 根据寄存器类型显示不同的详细信息
@@ -770,7 +779,6 @@ class CANFDCommunication:
         self.close()
         time.sleep(1)  # 等待1秒
         return self.initialize()
-        
 print = lambda *_, **__: None
 class DexterousHandModel:
     """灵巧手数据模型"""
@@ -785,6 +793,13 @@ class DexterousHandModel:
             'middle': np.zeros((6, 12)),
             'ring': np.zeros((6, 12)),
             'pinky': np.zeros((6, 12))
+        }
+        self.tactile_status = {
+            'thumb': False,
+            'index': False,
+            'middle': False,
+            'ring': False,
+            'pinky': False
         }
         self.last_update_time = time.time()
         self.target_torques = [500] * 17 # Add target torques
@@ -859,6 +874,11 @@ class DexterousHandModel:
         if finger in self.tactile_data:
             self.tactile_data[finger] = data.reshape((6, 12))
 
+    def update_tactile_status(self, finger: str, status: bool):
+        """更新触觉传感器在线状态"""
+        if finger in self.tactile_status:
+            self.tactile_status[finger] = status
+
     def set_target_positions(self, positions: List[int]):
         """设置目标位置"""
         for i, pos in enumerate(positions[:17]):
@@ -891,8 +911,8 @@ class DexterousHandModel:
 class DexterousHandController:
     """灵巧手控制器"""
 
-    def __init__(self):
-        self.comm = CANFDCommunication()
+    def __init__(self,hand_type="right"):
+        self.comm = CANFDCommunication(hand_type=hand_type)
         self.model = DexterousHandModel()
         self.is_running = False
         self.update_thread = None
@@ -1036,33 +1056,65 @@ class DexterousHandController:
     def _handle_tactile_message(self, reg_addr: int, data: bytes):
         """处理触觉传感器消息，拼接DATA1和DATA2"""
         finger_map = {
-            RegisterAddress.TACTILE_THUMB_DATA1.value: ('thumb', 'data1'),
-            RegisterAddress.TACTILE_THUMB_DATA2.value: ('thumb', 'data2'),
-            RegisterAddress.TACTILE_INDEX_DATA1.value: ('index', 'data1'),
-            RegisterAddress.TACTILE_INDEX_DATA2.value: ('index', 'data2'),
-            RegisterAddress.TACTILE_MIDDLE_DATA1.value: ('middle', 'data1'),
-            RegisterAddress.TACTILE_MIDDLE_DATA2.value: ('middle', 'data2'),
-            RegisterAddress.TACTILE_RING_DATA1.value: ('ring', 'data1'),
-            RegisterAddress.TACTILE_RING_DATA2.value: ('ring', 'data2'),
-            RegisterAddress.TACTILE_PINKY_DATA1.value: ('pinky', 'data1'),
-            RegisterAddress.TACTILE_PINKY_DATA2.value: ('pinky', 'data2'),
+            # 恢复标准协议定义 (Standard Protocol Mapping)
+            # RegisterAddress 命名本身已对应正确的手指
+            RegisterAddress.TACTILE_THUMB_DATA1.value: ('thumb', 'data1'),   # 0x09 -> Thumb
+            RegisterAddress.TACTILE_THUMB_DATA2.value: ('thumb', 'data2'),   # 0x0A -> Thumb
+            RegisterAddress.TACTILE_INDEX_DATA1.value: ('index', 'data1'),   # 0x0B -> Index
+            RegisterAddress.TACTILE_INDEX_DATA2.value: ('index', 'data2'),   # 0x0C -> Index
+            RegisterAddress.TACTILE_MIDDLE_DATA1.value: ('middle', 'data1'), # 0x0D -> Middle
+            RegisterAddress.TACTILE_MIDDLE_DATA2.value: ('middle', 'data2'), # 0x0E -> Middle
+            RegisterAddress.TACTILE_RING_DATA1.value: ('ring', 'data1'),     # 0x0F -> Ring
+            RegisterAddress.TACTILE_RING_DATA2.value: ('ring', 'data2'),     # 0x10 -> Ring
+            RegisterAddress.TACTILE_PINKY_DATA1.value: ('pinky', 'data1'),   # 0x11 -> Pinky
+            RegisterAddress.TACTILE_PINKY_DATA2.value: ('pinky', 'data2'),   # 0x12 -> Pinky
         }
         
         if reg_addr in finger_map:
             finger, part = finger_map[reg_addr]
             self.tactile_buffer[finger][part] = data
             
+            # 立即更新在线状态 (如果收到的是DATA1)
+            # DATA1的第一字节是状态位
+            if part == 'data1' and len(data) > 0:
+                is_online = (data[0] != 0)
+                self.model.update_tactile_status(finger, is_online)
+                if is_online:
+                     # 仅在在线时打印，或者仅在状态改变时打印会更好，这里先打印所有非零状态以调试
+                     print(f"   [DEBUG_TACTILE] Finger:{finger} Reg:0x{reg_addr:02X} StatusByte:0x{data[0]:02X} -> Online")
+
             # 如果两部分都到齐了，进行拼接和更新
             buf = self.tactile_buffer[finger]
             if buf['data1'] is not None and buf['data2'] is not None:
                 combined_data = bytes(buf['data1']) + bytes(buf['data2'])
-                if len(combined_data) >= 72:
-                    # 转换为 numpy 数组 (12x6)
-                    tactile_array = np.frombuffer(combined_data[:72], dtype=np.uint8).reshape((6, 12))
+                
+                # 协议说明: 索引0为在线状态，1..72为数据 (共73字节)
+                # 实际CAN传输可能是 64 + 8 = 72字节，或者 64 + N > 72字节
+                
+                if len(combined_data) >= 73:
+                    # 包含状态字节
+                    is_online = (combined_data[0] != 0)
+                    tactile_bytes = combined_data[1:73]
+                    
+                    self.model.update_tactile_status(finger, is_online)
+                    
+                    if len(tactile_bytes) == 72:
+                        tactile_array = np.frombuffer(tactile_bytes, dtype=np.uint8).reshape((6, 12))
+                        self.model.update_tactile_data(finger, tactile_array)
+                        
+                elif len(combined_data) == 72:
+                    # 只有72字节，假设全部是数据，且设备在线
+                    # 或者可能是 第1字节是状态，丢失了最后一个数据字节？
+                    # 鉴于协议明确提到 1..72 为数据，我们优先尝试解析为数据
+                    # 并假定既然收到了数据，设备就是在线的
+                    self.model.update_tactile_status(finger, True)
+                    
+                    tactile_array = np.frombuffer(combined_data, dtype=np.uint8).reshape((6, 12))
                     self.model.update_tactile_data(finger, tactile_array)
-                    # 清除缓冲区等待下一帧
-                    buf['data1'] = None
-                    buf['data2'] = None
+                
+                # 清除缓冲区等待下一帧
+                buf['data1'] = None
+                buf['data2'] = None
 
     def _update_loop(self):
         """更新循环"""
@@ -1093,20 +1145,15 @@ class DexterousHandController:
                 # 读取错误状态
                 self._read_error_status()
 
-                # 读取当前电流
-                self._read_motor_currents()
-
                 # 定期读取当前温度 (每10秒)
                 temp_read_counter += 1
-                if temp_read_counter == 1:
-                    self._read_current_temperatures()
-                elif temp_read_counter >= temp_read_interval:
+                if temp_read_counter >= temp_read_interval:
                     temp_read_counter = 0
                     self._read_current_temperatures()
 
-                # 读取触觉传感器数据（降低频率）
-                if connection_check_counter % 10 == 0:  # 每10次循环读取一次触觉数据
-                    self._read_tactile_data()
+                # 读取触觉传感器数据（由于是主动上报，不再主动轮询）
+                # if connection_check_counter % 10 == 0:  # 每10次循环读取一次触觉数据
+                #     self._read_tactile_data()
 
                 time.sleep(self.update_interval)
 
@@ -1922,6 +1969,7 @@ class DexterousHandGUI:
 
     def __init__(self):
         self.controller = DexterousHandController()
+        self.tactile_window = None
         self.root = tk.Tk()
         self.setup_window()
         self.create_widgets()
@@ -1970,7 +2018,7 @@ class DexterousHandGUI:
         style.theme_use('clam')
         
         # 定义暗黑主题颜色
-        colors = {
+        self.colors = {
             'bg_primary': '#1e1e1e',      # 主背景色
             'bg_secondary': '#2d2d2d',    # 次要背景色
             'bg_tertiary': '#3d3d3d',     # 第三级背景色
@@ -1985,6 +2033,7 @@ class DexterousHandGUI:
             'selected': '#0078d4',        # 选中色
             'accent_orange': '#ff9500'    # 橙色（用于温度）
         }
+        colors = self.colors
         
         # 配置Frame样式
         style.configure('Dark.TFrame', 
@@ -2173,8 +2222,8 @@ class DexterousHandGUI:
         # 主要内容区域 - 水平布局
         content_frame = ttk.Frame(main_frame, style='Dark.TFrame')
         content_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(2, 0))
-        content_frame.columnconfigure(0, weight=1)  # 左侧面板
-        content_frame.columnconfigure(1, weight=2)  # 中间面板（更宽）
+        content_frame.columnconfigure(0, weight=0)  # 左侧面板 (不扩展)
+        content_frame.columnconfigure(1, weight=10) # 中间面板 (占满主要空间)
         content_frame.columnconfigure(2, weight=1)  # 右侧面板
         content_frame.rowconfigure(0, weight=1)
         
@@ -2340,7 +2389,7 @@ class DexterousHandGUI:
             # 使用pack布局以便利用剩余空间 (一行显示所有状态)
             # 当前位置
             current_pos_var = tk.StringVar(value="0")
-            ttk.Label(info_frame, textvariable=current_pos_var, style='Status.TLabel', width=10).pack(side=tk.LEFT, padx=1)
+            ttk.Label(info_frame, textvariable=current_pos_var, style='Status.TLabel', width=8).pack(side=tk.LEFT, padx=1)
 
             # 当前温度
             current_temp_var = tk.StringVar(value="0°C")
@@ -2348,21 +2397,21 @@ class DexterousHandGUI:
 
             # 当前电流
             current_current_var = tk.StringVar(value="0mA")
-            ttk.Label(info_frame, textvariable=current_current_var, style='Status.TLabel', width=8).pack(side=tk.LEFT, padx=1)
+            ttk.Label(info_frame, textvariable=current_current_var, style='Status.TLabel', width=6).pack(side=tk.LEFT, padx=1)
 
             # 错误状态
             error_status_var = tk.StringVar(value="✅")
-            error_label = ttk.Label(info_frame, textvariable=error_status_var, style='Status.TLabel', width=4)
+            error_label = ttk.Label(info_frame, textvariable=error_status_var, style='Status.TLabel', width=3)
             error_label.pack(side=tk.LEFT, padx=1)
 
             # 关节偏差
             joint_offset_var = tk.StringVar(value="偏:0")
-            ttk.Label(info_frame, textvariable=joint_offset_var, style='Status.TLabel', width=8).pack(side=tk.LEFT, padx=1)
+            ttk.Label(info_frame, textvariable=joint_offset_var, style='Status.TLabel', width=6).pack(side=tk.LEFT, padx=1)
 
             # 目标位置输入框
             target_pos_var = tk.StringVar(value="0")
-            target_entry = ttk.Entry(info_frame, textvariable=target_pos_var, width=6, style='Dark.TEntry', justify='center')
-            target_entry.pack(side=tk.LEFT, padx=5)
+            target_entry = ttk.Entry(info_frame, textvariable=target_pos_var, width=5, style='Dark.TEntry', justify='center')
+            target_entry.pack(side=tk.LEFT, padx=2)
             
             # 第二行：位置滑块
             scale_frame = ttk.Frame(joint_control_frame, style='Dark.TFrame')
@@ -2395,30 +2444,28 @@ class DexterousHandGUI:
         tactile_frame = ttk.LabelFrame(parent, text="👆 触觉传感器", style='Dark.TLabelframe', padding="15")
         tactile_frame.grid(row=0, column=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(10, 0))
         tactile_frame.columnconfigure(0, weight=1)
-        tactile_frame.rowconfigure(1, weight=1)
+        tactile_frame.rowconfigure(0, weight=1)
         
-        # 传感器选择
-        sensor_control = ttk.Frame(tactile_frame, style='Dark.TFrame')
-        sensor_control.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 15))
-        sensor_control.columnconfigure(1, weight=1)
+        # 居中显示开启按钮
+        center_frame = ttk.Frame(tactile_frame, style='Dark.TFrame')
+        center_frame.grid(row=0, column=0)
         
-        ttk.Label(sensor_control, text="🖐️ 选择手指:", style='Dark.TLabel').grid(row=0, column=0, padx=(0, 10))
+        btn = ttk.Button(center_frame, text="🔁 打开独立监视窗口", 
+                         command=self.open_tactile_window, style='Primary.TButton')
+        btn.pack(pady=20, ipadx=10, ipady=5)
         
-        self.finger_var = tk.StringVar(value="拇指")
-        finger_combo = ttk.Combobox(sensor_control, textvariable=self.finger_var,
-                                   values=["拇指", "食指", "中指", "无名指", "小指"],
-                                   state="readonly", font=('微软雅黑', 9))
-        finger_combo.grid(row=0, column=1, sticky=(tk.W, tk.E))
-        finger_combo.bind('<<ComboboxSelected>>', self.on_finger_selected)
-        
-        # 触觉数据显示区域
-        tactile_display = ttk.Frame(tactile_frame, style='Card.TFrame')
-        tactile_display.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        tactile_display.columnconfigure(0, weight=1)
-        tactile_display.rowconfigure(0, weight=1)
-        
-        # 创建matplotlib图表
-        self.create_tactile_heatmap(tactile_display)
+        ttk.Label(center_frame, text="点击上方按钮打开\n触觉传感器实时热图", 
+                  style='Dark.TLabel', justify='center').pack(pady=10)
+
+    def open_tactile_window(self):
+        if self.tactile_window is None:
+            self.tactile_window = TactileSensorWindow(self.root, self.controller, self.colors, self.on_tactile_window_close)
+        else:
+            self.tactile_window.deiconify()
+            self.tactile_window.lift()
+
+    def on_tactile_window_close(self):
+        self.tactile_window = None
 
     def create_enhanced_action_sequence_panel(self, parent):
         """创建增强版动作序列面板"""
@@ -2571,47 +2618,11 @@ class DexterousHandGUI:
                                           command=self.clear_table, style='Danger.TButton')
         self.clear_table_btn.grid(row=0, column=3)
 
-    def create_tactile_heatmap(self, parent):
-        """创建触觉传感器热图"""
-        # 创建matplotlib图表
-        self.tactile_fig = Figure(figsize=(4, 6), dpi=80, facecolor='#2d2d2d')
-        self.tactile_ax = self.tactile_fig.add_subplot(111, facecolor='#2d2d2d')
-        
-        # 设置暗黑主题
-        self.tactile_ax.tick_params(colors='white')
-        self.tactile_ax.xaxis.label.set_color('white')
-        self.tactile_ax.yaxis.label.set_color('white')
-        self.tactile_ax.title.set_color('white')
-        
-        # 创建画布
-        self.tactile_canvas = FigureCanvasTkAgg(self.tactile_fig, parent)
-        self.tactile_canvas.get_tk_widget().grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        # 初始化热图数据
-        self.update_tactile_display()
-
     def update_tactile_display(self):
-        """更新触觉传感器显示"""
-        finger = self.finger_var.get() if hasattr(self, 'finger_var') else "拇指"
-        finger_map = {"拇指": "thumb", "食指": "index", "中指": "middle", "无名指": "ring", "小指": "pinky"}
-        
-        if finger in finger_map:
-            data = self.controller.model.tactile_data.get(finger_map[finger], np.zeros((6, 12)))
-            
-            self.tactile_ax.clear()
-            im = self.tactile_ax.imshow(data, cmap='hot', interpolation='nearest', aspect='auto')
-            self.tactile_ax.set_title(f'{finger}触觉传感器', color='white', fontsize=12)
-            self.tactile_ax.set_xlabel('传感器列', color='white')
-            self.tactile_ax.set_ylabel('传感器行', color='white')
-            
-            # 设置坐标轴颜色
-            self.tactile_ax.tick_params(colors='white')
-            
-            self.tactile_canvas.draw()
-
-    def on_finger_selected(self, event=None):
-        """手指选择事件"""
-        self.update_tactile_display()
+        """更新触觉传感器显示（通过独立窗口）"""
+        """更新触觉传感器显示（通过独立窗口）"""
+        # 独立窗口已有自己的定时刷新循环，此处无需操作
+        pass
 
     def on_sequence_double_click(self, event):
         """序列表格双击事件"""
