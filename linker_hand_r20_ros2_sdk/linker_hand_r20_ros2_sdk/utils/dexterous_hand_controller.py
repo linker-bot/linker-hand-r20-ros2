@@ -278,7 +278,7 @@ class CANFDCommunication:
                     0x0,      # DatTseg1: 数据段时间段1
                     0x0,      # DatTseg2: 数据段时间段2
                     0x0,      # DatSJW: 数据段同步跳转宽度
-                    0x0,      # Config: 配置标志
+                    0x04,      # Config: 配置标志
                     0x0,      # Model: 模式
                     0x1       # Cantype: CANFD类型
                 )
