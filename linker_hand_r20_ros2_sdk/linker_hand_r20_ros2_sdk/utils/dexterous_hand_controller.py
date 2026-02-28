@@ -1126,6 +1126,7 @@ class DexterousHandController:
         while self.is_running:
             try:
                 # 定期检查连接状态
+                '''
                 connection_check_counter += 1
                 if connection_check_counter >= connection_check_interval:
                     connection_check_counter = 0
@@ -1135,7 +1136,7 @@ class DexterousHandController:
                             print("重连失败，暂停数据更新")
                             time.sleep(1)
                             continue
-
+                '''
                 # 读取当前位置
                 self._read_current_positions()
 
